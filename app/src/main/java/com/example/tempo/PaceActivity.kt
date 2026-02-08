@@ -2,6 +2,8 @@ package com.example.tempo
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.content.res.ColorStateList
+import android.graphics.Color
 import android.media.AudioManager
 import android.media.ToneGenerator
 import android.os.Bundle
@@ -10,6 +12,7 @@ import android.os.Looper
 import android.view.View
 import android.widget.Button
 import android.widget.EditText
+import android.widget.ProgressBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
@@ -34,7 +37,7 @@ object PaceConverter {
     }
 
     /** Checks if current pace is within a 5% window of target */
-    fun isWithinWindow(current: Float, target: Float, margin: Float = 0.05f): Boolean {
+    fun isWithinWindow(current: Float, target: Float, margin: Float): Boolean {
         if (current <= 0f) return false
         val diff = kotlin.math.abs(current - target)
         return (diff / target) <= margin
@@ -49,6 +52,55 @@ object PaceConverter {
     }
 }
 
+class Metronome(private val beatFrequencyStep: Long = 50L){
+    private val toneGen = ToneGenerator(AudioManager.STREAM_MUSIC, 100)
+    private val handler = Handler(Looper.getMainLooper())
+    private var beatInterval: Long = 500
+    private var isRunning = false
+    var isMuted = false // Controlled by our 5% window logic
+    private var currentTone = ToneGenerator.TONE_PROP_BEEP
+
+    private val tickRunnable = object : Runnable {
+        override fun run() {
+            if (!isRunning) return
+            if (!isMuted) toneGen.startTone(currentTone, 100)
+            handler.postDelayed(this, beatInterval)
+        }
+    }
+
+    fun setTone(toneType: Int) {
+        currentTone = toneType
+    }
+
+    fun start() {
+        if (isRunning) return
+        isRunning = true
+        handler.post(tickRunnable)
+    }
+
+    fun stop() {
+        isRunning = false
+        handler.removeCallbacksAndMessages(null)
+    }
+
+    fun updateBeepRegime(currentPace: Float, target: Float, withinWindow: Boolean){
+        isMuted = withinWindow
+        if(!withinWindow){
+            if(currentPace > target){  // got to run faster
+                setTone(ToneGenerator.TONE_CDMA_LOW_L)
+                beatInterval = (beatInterval - beatFrequencyStep).coerceAtLeast(200)
+            } else {
+                setTone(ToneGenerator.TONE_SUP_PIP)
+                beatInterval = (beatInterval + beatFrequencyStep).coerceAtMost(1000)
+            }
+        }
+    }
+
+    fun release() {
+        stop()
+        toneGen.release()
+    }
+}
 class WorkoutManager(
     highPace: Float, highDur: Int,
     lowPace: Float, lowDur: Int,
@@ -60,8 +112,8 @@ class WorkoutManager(
 
     init {
         repeat(numIntervals) {
-            intervals.add(Interval("High", highPace, highDur))
             intervals.add(Interval("Low", lowPace, lowDur))
+            intervals.add(Interval("High", highPace, highDur))
         }
         intervals.add(Interval("Cooldown", coolPace, coolDur))
     }
@@ -119,45 +171,82 @@ class WorkoutManager(
         }
     }
 }
+class SpeedHistory(private val windowSize: Int) {
+    private val history = mutableListOf<Float>()
 
+    /** Adds a new raw m/s reading and returns the smoothed m/s average */
+    fun addAndGetAverage(newSpeed: Float): Float {
+        history.add(newSpeed)
 
+        // Remove the oldest reading if we exceed the window size
+        if (history.size > windowSize) {
+            history.removeAt(0)
+        }
+
+        // Return the average of the current window
+        return history.average().toFloat()
+    }
+
+    /** Clears the history (call this when a session stops or pauses) */
+    fun clear() {
+        history.clear()
+    }
+}
+class PaceUIManager(activity: AppCompatActivity) {
+    private val statusCircle: View = activity.findViewById(R.id.statusCircle)
+    private val paceText: TextView = activity.findViewById(R.id.textCurrentPace)
+    private val statusText: TextView = activity.findViewById(R.id.textIntervalStatus)
+    private val progressBar: ProgressBar = activity.findViewById(R.id.intervalProgress)
+    private val btnStart: Button = activity.findViewById(R.id.btnStart)
+    private var lastStatus: String = ""
+    fun updatePaceDisplay(pace: Float, target: Float, isWithinWindow: Boolean) {
+        paceText.text = PaceConverter.formatPace(pace)
+
+        val color = when {
+            isWithinWindow -> Color.GREEN
+            pace > target -> Color.RED  // Too slow
+            else -> Color.CYAN         // Too fast
+        }
+        statusCircle.backgroundTintList = ColorStateList.valueOf(color)
+    }
+
+    fun updateIntervalProgress(progress: Int, status: String) {
+        progressBar.progress = progress
+        if (status != lastStatus) {
+            statusText.text = status
+            lastStatus = status
+        }
+    }
+    fun resetToDefaultState() {
+        paceText.text = "--:--"
+        statusText.text = "Ready"
+        progressBar.progress = 0
+
+        // Reset circle to Grey
+        statusCircle.backgroundTintList = ColorStateList.valueOf(Color.GRAY)
+    }
+    fun setRunningMode(isRunning: Boolean) {
+        btnStart.isEnabled = !isRunning
+        if (isRunning) btnStart.text = "Running..." else btnStart.text = "Start 4x4 HIIT"
+        btnStart.alpha = if (isRunning) 0.5f else 1.0f
+    }
+}
 class PaceActivity : AppCompatActivity() {
-    private var intervalList = mutableListOf<Interval>()
-    private var currentIntervalIndex = 0
+    private lateinit var uiManager: PaceUIManager
+    private val metronome = Metronome()
     private var currentTimer: android.os.CountDownTimer? = null
-
     private lateinit var fusedLocationClient: FusedLocationProviderClient
-    private var targetPace: Float = 10.0f // Default 10 min/mile
-    private var currentPace: Float = 0f
-
     private var currentSpeed: Float = 0f
-
-    private val toneGen = ToneGenerator(AudioManager.STREAM_MUSIC, 100)
-    private val handler = Handler(Looper.getMainLooper())
-    private var beatInterval: Long = 500
-    private var isWithinTargetWindow: Boolean = false
-    private val speedHistory = mutableListOf<Float>()
-    private val SMOOTHING_WINDOW = 5 // Number of readings to average
-
     private var workoutManager: WorkoutManager? = null
-
+    private val speedHistory = SpeedHistory(windowSize = 5)
     // 1. Define the Callback as a member variable
+
     private val locationCallback = object : LocationCallback() {
         override fun onLocationResult(locationResult: LocationResult) {
             for (location in locationResult.locations) {
                 location?.let {
-                    // 1. Add new speed to history
-                    speedHistory.add(it.speed)
-
-                    // 2. Keep only the last X readings
-                    if (speedHistory.size > SMOOTHING_WINDOW) {
-                        speedHistory.removeAt(0)
-                    }
-
-                    // 3. Calculate average speed
-                    currentSpeed = speedHistory.average().toFloat()
-
-                    // 4. Update UI and Metronome
+                    // Feed raw speed into the history class and get the "clean" speed back
+                    currentSpeed = speedHistory.addAndGetAverage(it.speed)
                     adjustBeatFrequency()
                 }
             }
@@ -176,7 +265,8 @@ class PaceActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
-
+        uiManager = PaceUIManager(this)
+        uiManager.resetToDefaultState()
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
         checkAndRequestPermissions()
     }
@@ -194,17 +284,10 @@ class PaceActivity : AppCompatActivity() {
         val btnStop = findViewById<Button>(R.id.btnStop)
 
         btnStart.setOnClickListener {
-            // 1. Capture user inputs from the UI
             workoutManager = WorkoutManager.fromUI(this)
-            // 3. Reset the state index and start the hardware services
-            currentIntervalIndex = 0
+            uiManager.setRunningMode(true)
+            metronome.start()
             startLocationUpdates()
-            startMetronome()
-
-            // 4. Update UI State
-            btnStart.isEnabled = false
-
-            // 5. Kick off the first interval
             startNextInterval()
         }
 
@@ -220,94 +303,69 @@ class PaceActivity : AppCompatActivity() {
             fusedLocationClient.requestLocationUpdates(request, locationCallback, Looper.getMainLooper())
         }
     }
-
     private fun adjustBeatFrequency() {
-        val statusCircle = findViewById<View>(R.id.statusCircle)
-        val textCurrentPace = findViewById<TextView>(R.id.textCurrentPace)
-        val textIntervalStatus = findViewById<TextView>(R.id.textIntervalStatus)
-
-
-        // 1. Use the static converter to get the pace
-        currentPace = PaceConverter.msToPace(currentSpeed)
-
-        // 2. Update the UI text using our formatting logic
-        textCurrentPace.text = PaceConverter.formatPace(currentPace)
-        // Inside adjustBeatFrequency
-        textIntervalStatus.text = workoutManager?.getShortStatusString()
-
-        if (currentSpeed < 0.1f) {
-            statusCircle.backgroundTintList = android.content.res.ColorStateList.valueOf(android.graphics.Color.GRAY)
-            isWithinTargetWindow = false
-            return
-        }
-
-        // 3. Check the "Sweet Spot" using the refactored logic
-        isWithinTargetWindow = PaceConverter.isWithinWindow(currentPace, targetPace)
-
-        if (isWithinTargetWindow) {
-            statusCircle.backgroundTintList = android.content.res.ColorStateList.valueOf(android.graphics.Color.GREEN)
-        } else {
-            // 4. Handle color coding for off-pace
-            if (currentPace > targetPace) {
-                // Too slow (higher pace number)
-                statusCircle.backgroundTintList = android.content.res.ColorStateList.valueOf(android.graphics.Color.RED)
-                beatInterval = (beatInterval - 50).coerceAtLeast(200)
-            } else {
-                // Too fast (lower pace number)
-                statusCircle.backgroundTintList = android.content.res.ColorStateList.valueOf(android.graphics.Color.CYAN)
-                beatInterval = (beatInterval + 50).coerceAtMost(1000)
-            }
-        }
-    }
-
-    private fun startMetronome() {
-        handler.post(object : Runnable {
-            override fun run() {
-                // Only beep if we are NOT in the 5% target window
-                if (!isWithinTargetWindow) {
-                    toneGen.startTone(ToneGenerator.TONE_PROP_BEEP, 100)
-                }
-
-                // Re-queue the next beat regardless so the rhythm is ready
-                handler.postDelayed(this, beatInterval)
-            }
-        })
+        val target = workoutManager?.getCurrentInterval()?.targetPace ?: return
+        val currentPace = PaceConverter.msToPace(currentSpeed)
+        val withinWindow = PaceConverter.isWithinWindow(currentPace, target, 0.05f)
+        // The UI Manager handles all the colors and text IDs!
+        uiManager.updatePaceDisplay(currentPace, target, withinWindow)
+        // The Activity just handles the logic of the Metronome
+        metronome.updateBeepRegime(currentPace, target, withinWindow)
     }
     private fun startNextInterval() {
+        // 1. Get the current chunk of the workout
         val interval = workoutManager?.getCurrentInterval() ?: run {
-            stopSession()
+            stopSession() // No more intervals? Shut it all down.
             return
         }
 
-        val textIntervalStatus = findViewById<TextView>(R.id.textIntervalStatus)
-        textIntervalStatus.text = workoutManager?.getShortStatusString()
-
-        // Update target for metronome
-        targetPace = interval.targetPace
-
-        // Update UI using our Refactored classes
-        val btnStart = findViewById<Button>(R.id.btnStart)
-        btnStart.text = "${interval.type}: ${workoutManager?.getProgressString()}"
-
-        toneGen.startTone(ToneGenerator.TONE_CDMA_PIP, 500)
-
+        //speedHistory.clear()
+        metronome.start()  // We use the metronome's toneGen if public, or just start the metronome
         currentTimer?.cancel()
-        currentTimer = object : android.os.CountDownTimer(interval.durationSeconds * 1000L, 1000) {
-            override fun onTick(millisLeft: Long) { /* Update timer UI */ }
-
+        currentTimer = object : android.os.CountDownTimer(interval.durationSeconds * 1000L, 100) {
+            val totalTime = interval.durationSeconds * 1000L
+            override fun onTick(millisUntilFinished: Long) {
+                val progress = ((totalTime - millisUntilFinished).toFloat() / totalTime * 100).toInt()
+                // UI Manager handles the text and progress bar updates
+                uiManager.updateIntervalProgress(
+                    progress = progress,
+                    status = workoutManager?.getShortStatusString() ?: ""
+                )
+            }
             override fun onFinish() {
-                workoutManager?.nextInterval()
-                startNextInterval()
+                uiManager.updateIntervalProgress(100, "Done")
+                workoutManager?.nextInterval() // Move the state machine forward
+                startNextInterval() // Loop to the next interval
             }
         }.start()
     }
 
     private fun stopSession() {
-        currentTimer?.cancel() // Stop the countdown
-        fusedLocationClient.removeLocationUpdates(locationCallback) // Stop GPS
-        handler.removeCallbacksAndMessages(null) // Stop Metronome
+        // 1. Stop the State Machine (Timer)
+        currentTimer?.cancel()
+        currentTimer = null
 
-        val btnStart = findViewById<Button>(R.id.btnStart)
-        btnStart.isEnabled = true
-        btnStart.text = "Start 4x4 HIIT"
-    }}
+        // 2. Stop the Audio Engine (Metronome)
+        metronome.stop()
+
+        // 3. Stop the Hardware (GPS)
+        fusedLocationClient.removeLocationUpdates(locationCallback)
+
+        // 4. Reset UI Elements
+        uiManager.setRunningMode(false)
+        uiManager.resetToDefaultState()
+        Toast.makeText(this, "Workout Complete!", Toast.LENGTH_SHORT).show()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        metronome.release()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        // If the user leaves the app, we should probably stop the session
+        // to save battery, unless you implement a Foreground Service later.
+        stopSession()
+    }
+}
