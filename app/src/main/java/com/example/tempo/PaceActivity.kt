@@ -10,6 +10,7 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.View
+import android.view.WindowManager
 import android.widget.Button
 import android.widget.EditText
 import android.widget.ProgressBar
@@ -55,7 +56,7 @@ object PaceConverter {
 class Metronome(private val beatFrequencyStep: Long = 50L){
     private val toneGen = ToneGenerator(AudioManager.STREAM_MUSIC, 100)
     private val handler = Handler(Looper.getMainLooper())
-    private var beatInterval: Long = 500
+    private var beatInterval: Long = 1000
     private var isRunning = false
     var isMuted = false // Controlled by our 5% window logic
     private var currentTone = ToneGenerator.TONE_PROP_BEEP
@@ -265,6 +266,7 @@ class PaceActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         uiManager = PaceUIManager(this)
         uiManager.resetToDefaultState()
         fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
